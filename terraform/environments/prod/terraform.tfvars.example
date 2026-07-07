@@ -1,0 +1,8 @@
+# Copy this file to terraform.tfvars and adjust as needed.
+# terraform.tfvars is gitignored — never commit real values here if they
+# become sensitive in the future.
+
+project        = "notes-api"
+aws_region     = "us-east-1"
+container_port = 8000
+desired_count  = 2

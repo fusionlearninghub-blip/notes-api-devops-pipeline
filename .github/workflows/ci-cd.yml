@@ -1,0 +1,142 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # required for OIDC auth to AWS (no long-lived keys)
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: notes-api
+  ECS_CLUSTER: notes-api-cluster
+  ECS_SERVICE: notes-api-service
+  ECS_TASK_FAMILY: notes-api
+  CONTAINER_NAME: notes-api
+
+jobs:
+  # ---------- Runs on every push and PR ----------
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: app/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r app/requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check app/
+
+      - name: Run tests
+        run: pytest app/tests/ -v
+
+  # ---------- Build & scan image; only after tests pass, only on main ----------
+  build-and-push:
+    name: Build, Scan, Push Image
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "image_tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg GIT_SHA=${{ steps.meta.outputs.image_tag }} \
+            -t $ECR_REPOSITORY:${{ steps.meta.outputs.image_tag }} \
+            app/
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}"
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1" # fail the build on critical/high CVEs
+
+      - name: Tag & push to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          docker tag $ECR_REPOSITORY:${{ steps.meta.outputs.image_tag }} \
+            $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.meta.outputs.image_tag }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.meta.outputs.image_tag }}
+
+  # ---------- Deploy gate: requires manual approval via GitHub Environment ----------
+  deploy:
+    name: Deploy to Production
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: production  # configure required reviewers on this environment in repo settings
+      url: http://${{ steps.get-url.outputs.alb_dns }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition $ECS_TASK_FAMILY \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new task definition with updated image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
+
+      - name: Deploy to ECS (rolling update)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Get ALB URL
+        id: get-url
+        run: |
+          DNS=$(aws elbv2 describe-load-balancers \
+            --names notes-api-alb \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "alb_dns=$DNS" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test /health
+        run: |
+          curl -sf "http://${{ steps.get-url.outputs.alb_dns }}/health" || \
+            (echo "Health check failed post-deploy" && exit 1)

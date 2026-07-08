@@ -122,3 +122,4 @@ an interview.
 Roughly $35–50/month running continuously (ALB ~$16, NAT Gateway ~$32,
 Fargate tasks minimal at this scale). Destroy with `terraform destroy`
 when not actively demoing it.
+

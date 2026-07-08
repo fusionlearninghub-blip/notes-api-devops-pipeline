@@ -5,7 +5,6 @@ and observability around it are the point of this project.
 """
 from datetime import datetime, timezone
 from uuid import uuid4
-from typing import Optional
 
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
